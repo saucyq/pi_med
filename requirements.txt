@@ -1,6 +1,5 @@
 opencv-python
 numpy
-detectron2
 ultralytics
-Pillow
+pillow
 requests
