@@ -1,0 +1,6 @@
+opencv-python
+numpy
+detectron2
+ultralytics
+Pillow
+requests
