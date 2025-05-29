@@ -1,8 +1,5 @@
 import cv2
 import numpy as np
-from detectron2.engine import DefaultPredictor
-from detectron2.config import get_cfg
-from detectron2 import model_zoo
 from ultralytics import YOLO
 import threading
 import base64
@@ -11,10 +8,12 @@ import requests
 from io import BytesIO
 from PIL import Image
 import random
-# pour l affichage une fois la détection
+
+# --- Utilities ---
+
 def random_color():
     return ''.join([random.choice('0123456789ABCDEF') for _ in range(6)])
-# génère les éléments a tester
+
 def send_pick_request(x, y):
     pick_url  = "http://lifesciencedb.jp/bp3d/API/pick"
     pick_payload  = {
@@ -86,15 +85,13 @@ def send_pick_request(x, y):
     print("✅ Pick API Result:")
     print(json.dumps(result, indent=2))
     result = pick_response.json()
-    # nom des éléments
     part_names = list({pin["PinPartName"] for pin in result.get("Pin", [])})
-    #génère l image de fin
+
     image_url = 'http://lifesciencedb.jp/bp3d/API/image'
     image_payload = {
         "Part": [{"PartName": "anatomical entity", "PartColor": "F0D2A0", "PartOpacity": 0.1}],
         "Window": {"ImageWidth": 500, "ImageHeight": 500}
     }
-
     for name in part_names:
         image_payload["Part"].append({
             "PartName": name,
@@ -129,116 +126,156 @@ def send_pick_request(x, y):
     else:
         print("Image request failed with status:", image_response.status_code)
 
+# --- Async Video Capture Class ---
 
-# charge l image pour "voir ou on pointe"
+class VideoCaptureAsync:
+    def __init__(self, src=0):
+        self.src = src
+        self.cap = cv2.VideoCapture(self.src)
+        self.ret, self.frame = self.cap.read()
+        self.running = False
+        self.read_lock = threading.Lock()
+
+    def start(self):
+        if self.running:
+            return None
+        self.running = True
+        self.thread = threading.Thread(target=self.update, args=())
+        self.thread.start()
+        return self
+
+    def update(self):
+        while self.running:
+            ret, frame = self.cap.read()
+            with self.read_lock:
+                self.ret = ret
+                self.frame = frame
+
+    def read(self):
+        with self.read_lock:
+            frame = self.frame.copy()
+            ret = self.ret
+        return ret, frame
+
+    def stop(self):
+        self.running = False
+        self.thread.join()
+
+    def __exit__(self, exec_type, exc_value, traceback):
+        self.cap.release()
+
+    def release(self):
+        """Make it behave like cv2.VideoCapture"""
+        self.stop()
+        self.cap.release()
+
+# --- Load your static image ---
 image_path = "body.png"
 img = cv2.imread(image_path)
 if img is None:
     print("Error: Could not load image.")
     exit()
 
-# modèle squelette
-cfg = get_cfg()
-cfg.merge_from_file(model_zoo.get_config_file("COCO-Keypoints/keypoint_rcnn_R_50_FPN_1x.yaml"))
-cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = 0.7
-cfg.MODEL.WEIGHTS = model_zoo.get_checkpoint_url("COCO-Keypoints/keypoint_rcnn_R_50_FPN_1x.yaml")
-predictor = DefaultPredictor(cfg)
+# --- Load YOLO Models ---
 
-# modèle dispositif
-yolo_model = YOLO("best.pt")
+# YOLO keypoint model replacing Detectron2 COCO keypoint model
+# Replace "yolo_keypoint_model.pt" with your actual YOLO keypoint model path
+yolo_keypoint_model  = YOLO('yolo11n-pose.pt')
+
+# YOLO segmentation/detection model
+yolo_segmentation_model = YOLO("best.pt")
 
 class_names = {0: "background", 1: "manche", 2: "dispositif"}
 
-cam = cv2.VideoCapture(0)
-
+# --- Start async video capture ---
+cam = VideoCaptureAsync(0).start()
+image_path = "body.png"
+img = cv2.imread(image_path)
 while True:
-    #reset pour redétecter le dispositif
-    if cv2.waitKey(1) & 0xFF == ord('a'):
-        send_pick_request.started = False
-        print("reset")
-
+    output_img = img.copy()
     ret, frame = cam.read()
     if not ret:
         break
 
-    outputs = predictor(frame)
-    instances = outputs["instances"]
-    keypoints = instances.pred_keypoints if instances.has("pred_keypoints") else []
+    # Run both models
+    kp_results = yolo_keypoint_model(frame, verbose=False)
+    seg_results = yolo_segmentation_model(frame, verbose=False)
 
-    results = yolo_model.predict(frame, verbose=False)[0]
-    masks = results.masks
-    classes = results.boxes.cls.int().tolist() if results.boxes is not None else []
-    boxes = results.boxes.xyxy.cpu().numpy() if results.boxes is not None else []
+    # Default values
+    keypoints = None
+    left_shoulder = None
+    right_shoulder = None
 
-    output_img = img.copy()
+    # === Keypoint Detection ===
+    for result in kp_results:
+        if hasattr(result, "keypoints") and result.keypoints is not None:
+            kp_data = result.keypoints
+            if kp_data is not None and kp_data.shape[0] > 0:
+                kp_numpy = kp_data.data.cpu().numpy()[0]  # (17, 3)
+                keypoints = kp_numpy
+                left_shoulder = kp_numpy[5][:2]
+                right_shoulder = kp_numpy[6][:2]
+                # Draw keypoints (shoulders)
+                for i in [5, 6]:  # left & right shoulder
+                    x, y, conf = kp_numpy[i]
+                    if conf > 0.3:
+                        cv2.circle(frame, (int(x), int(y)), 5, (0, 0, 255), -1)
 
-    # affiche les masques yolo
-    if masks is not None and len(masks.data) > 0:
-        for i, mask in enumerate(masks.data):
-            cls_id = classes[i]
-            mask_np = mask.cpu().numpy().astype(np.uint8) * 255
-            colored_mask = np.zeros_like(frame)
+    # === Segmentation Detection ===
+    for result in seg_results:
+        masks = getattr(result, "masks", None)
+        boxes = getattr(result, "boxes", None)
 
-            if cls_id == 1:
-                color = (0, 255, 0)
-            elif cls_id == 2:
-                color = (255, 0, 0)
-            else:
-                color = (0, 0, 255)
-
-            colored_mask[mask_np > 0] = color
-            frame = cv2.addWeighted(frame, 1.0, colored_mask, 0.5, 0)
-
-    if len(keypoints) > 0:
-        kp = keypoints[0]
-        # keypoint de coco
-        left_shoulder = kp[5][:2].cpu().numpy()
-        right_shoulder = kp[6][:2].cpu().numpy()
-        torso_min_x = left_shoulder[0]
-        torso_max_x = right_shoulder[0]
-
-        if masks is not None and len(masks.data) > 0:
+        if masks is not None and masks.data is not None and boxes is not None:
+            classes = boxes.cls
             for i, mask in enumerate(masks.data):
-                cls_id = classes[i]
-                if cls_id == 2:
+                cls_id = int(classes[i].item())
+                if cls_id == 2:  # Assuming class 2 is your "device"
                     mask_np = mask.cpu().numpy().astype(np.uint8)
                     ys, xs = np.where(mask_np > 0)
                     if len(xs) == 0:
                         continue
-                    median_x_mask = np.median(xs)
-                    median_y_mask = np.median(ys)
+                    median_x = np.median(xs)
+                    median_y = np.median(ys)
+                    last_device_location = (median_x, median_y)
+                    device_x, device_y = last_device_location
                     avg_shoulder_y = (left_shoulder[1] + right_shoulder[1]) / 2
-                    percent = ((median_x_mask - torso_min_x) / (torso_max_x - torso_min_x + 1e-6)) * 100
-                    #magic number pour l'image "body.png"
+                    y_on_static_img = int(100 + (device_y - avg_shoulder_y))
+                    min_x = min(left_shoulder[0], right_shoulder[0])
+                    max_x = max(left_shoulder[0], right_shoulder[0])
+                    percent = ((device_x - min_x) / (max_x - min_x + 1e-6)) * 100
                     static_x_start = 100
                     static_x_end = 377
                     x_on_static_img = int(static_x_start + (percent / 100) * (static_x_end - static_x_start))
-                    y_on_static_img = int(100 + (median_y_mask - avg_shoulder_y))
-                    #pour pas envoyé plusieurs requetes
-                    if not getattr(send_pick_request, "started", False):
-                        send_pick_request.started = True
-                        threading.Thread(target=send_pick_request, args=(x_on_static_img, y_on_static_img)).start()
                     cv2.circle(output_img, (x_on_static_img, y_on_static_img), 15, (255, 0, 0), -1)
-                    cv2.putText(output_img, f"{percent:.1f}%", (x_on_static_img + 10, y_on_static_img),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+                    cv2.circle(frame, (int(median_x), int(median_y)), 10, (255, 0, 0), -1)
 
-        # dessine les épaules
-        cv2.circle(frame, tuple(left_shoulder.astype(int)), 10, (0, 255, 255), -1)
-        cv2.circle(frame, tuple(right_shoulder.astype(int)), 10, (0, 255, 255), -1)
+    # === Handle 'p' key to print positions ===
+    key = cv2.waitKey(1) & 0xFF
+    if key == ord('p'):
+        if left_shoulder is not None and right_shoulder is not None:
+            print(f"Left shoulder: ({left_shoulder[0]:.1f}, {left_shoulder[1]:.1f})")
+            print(f"Right shoulder: ({right_shoulder[0]:.1f}, {right_shoulder[1]:.1f})")
+            if last_device_location is not None:
+                device_x, device_y = last_device_location
+                avg_shoulder_y = (left_shoulder[1] + right_shoulder[1]) / 2
+                y_on_static_img = int(100 + (device_y - avg_shoulder_y))
+                min_x = min(left_shoulder[0], right_shoulder[0])
+                max_x = max(left_shoulder[0], right_shoulder[0])
+                percent = ((device_x - min_x) / (max_x - min_x + 1e-6)) * 100
+                static_x_start = 100
+                static_x_end = 377
+                x_on_static_img = int(static_x_start + (percent / 100) * (static_x_end - static_x_start))
 
-    # affiche les détection yolo
-    for box, cls_id in zip(boxes, classes):
-        x1, y1, x2, y2 = box.astype(int)
-        color = (0, 255, 0) if cls_id == 1 else (255, 0, 0) if cls_id == 2 else (0, 0, 255)
-        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-        class_text = class_names.get(cls_id, f"cls{cls_id}")
-        cv2.putText(frame, class_text, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+                send_pick_request(x_on_static_img,y_on_static_img)
+        else:
+            print("Shoulders not detected.")
 
-    cv2.imshow("Camera Frame", frame)
-    cv2.imshow("Static Image with Class 2 points", output_img)
-
-    if cv2.waitKey(1) & 0xFF == ord('q'):
+    if key == 27:  # ESC key
         break
+
+    cv2.imshow("Frame", frame)
+    cv2.imshow("Static Image with Class 2 points", output_img)
 
 cam.release()
 cv2.destroyAllWindows()
